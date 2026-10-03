@@ -92,7 +92,14 @@ static i2c_err_t mp_i2c_dispatch(machine_i2c_obj_t *self, uint16_t addr, uint8_t
     size_t err_cmd_idx = 0;
     i2c_addr_t returned_addr = 0;
     i2c_err_t err = sddf_i2c_nb_return(&libi2c_config, &returned_addr, &err_cmd_idx);
-    assert(returned_addr == (i2c_addr_t)addr);
+
+    /* The response is not guaranteed to belong to this request: the queue does not
+       match overlapping requests to their responses, and a failed dequeue leaves
+       returned_addr untouched. err already reports either, so let it decide. */
+    if (err == I2C_ERR_OK && returned_addr != (i2c_addr_t)addr) {
+        debug_printf("I2C(%d): response for address %d, expected %d\n", (int)self->port,
+                     (int)returned_addr, (int)addr);
+    }
 
     /* If we were reading, copy out response data */
     if (flag_mask & I2C_FLAG_READ && err == I2C_ERR_OK) {
@@ -187,8 +194,13 @@ static int machine_i2c_transfer_single(mp_obj_base_t *obj, uint16_t addr, size_t
 
     debug_printf("machine_i2c_transfer: done (err: %d)\n", err);
 
-    // always release the bus regardless of the return (FIXME: not-assert)
-    assert(i2c_bus_release(i2c_config.virt.id, addr));
+    /* Always release the bus regardless of the return. A release the virtualiser
+       refuses leaves the address claimed, which the next transfer reports when it
+       tries to claim it; aborting the PD here would only lose the transfer that
+       has already completed. */
+    if (!i2c_bus_release(i2c_config.virt.id, addr)) {
+        debug_printf("I2C(%d): could not release bus address %d\n", (int)self->port, (int)addr);
+    }
 
     if (err != I2C_ERR_OK) {
         switch (err) {

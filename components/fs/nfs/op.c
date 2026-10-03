@@ -200,7 +200,46 @@ fail_duplicate:
     reply((fs_cmpl_t){ .id = cmd.id, .status = status, .data = {0} });
 }
 
+static void deinitialise_cb(int status, struct nfs_context *nfs_ctx, void *data, void *private_data) {
+    struct continuation *cont = private_data;
+    fs_cmpl_t cmpl = { .id = cont->request_id, .status = FS_STATUS_SUCCESS, .data = {0} };
+
+    if (status != 0) {
+        dlog("failed to unmount nfs server (%d): %s", status, (char *)data);
+        cmpl.status = FS_STATUS_ERROR;
+        goto fail;
+    }
+
+    dlog("disconnected from nfs server");
+    /* Only tear the context down once the server is no longer using it, so that a
+       failed unmount leaves the mount intact and the client free to try again. */
+    nfs_destroy_context(nfs);
+    nfs = NULL;
+
+fail:
+    continuation_free(cont);
+    reply(cmpl);
+}
+
 void handle_deinitialise(fs_cmd_t cmd) {
+    dlog("received deinitialise command");
+
+    if (nfs == NULL) {
+        dlog("deinitialise command without an initialise");
+        reply((fs_cmpl_t){ .id = cmd.id, .status = FS_STATUS_ERROR, .data = {0} });
+        return;
+    }
+
+    struct continuation *cont = continuation_alloc();
+    assert(cont != NULL);
+    cont->request_id = cmd.id;
+
+    int err = nfs_umount_async(nfs, deinitialise_cb, cont);
+    if (err) {
+        dlog("failed to enqueue deinitialise command");
+        continuation_free(cont);
+        reply((fs_cmpl_t){ .id = cmd.id, .status = FS_STATUS_ERROR, .data = {0} });
+    }
 }
 
 static void stat_cb(int status, struct nfs_context *nfs, void *data, void *private_data) {
@@ -460,7 +499,7 @@ void handle_file_read(fs_cmd_t cmd) {
     uint64_t status = FS_STATUS_ERROR;
     fs_cmd_params_file_read_t params = cmd.params.file_read;
 
-    char *buf = fs_get_client_buffer(fs_share, CLIENT_SHARE_SIZE, params.buf);
+    char *buf = fs_get_client_slot(fs_share, CLIENT_SHARE_SIZE, params.buf);
     if (buf == NULL) {
         dlog("invalid output buffer provided");
         status = FS_STATUS_INVALID_BUFFER;
@@ -518,7 +557,7 @@ void handle_file_write(fs_cmd_t cmd) {
     uint64_t status = FS_STATUS_ERROR;
     fs_cmd_params_file_write_t params = cmd.params.file_write;
 
-    char *buf = fs_get_client_buffer(fs_share, CLIENT_SHARE_SIZE, params.buf);
+    char *buf = fs_get_client_slot(fs_share, CLIENT_SHARE_SIZE, params.buf);
     if (buf == NULL) {
         dlog("invalid output buffer provided");
         status = FS_STATUS_INVALID_BUFFER;
@@ -577,7 +616,7 @@ void handle_rename(fs_cmd_t cmd) {
         status = FS_STATUS_INVALID_PATH;
         goto fail_buffer;
     }
-    err = fs_copy_client_path(new_path, fs_share, CLIENT_SHARE_SIZE, params.old_path);
+    err = fs_copy_client_path(new_path, fs_share, CLIENT_SHARE_SIZE, params.new_path);
     if (err) {
         dlog("invalid path buffer provided");
         status = FS_STATUS_INVALID_PATH;
